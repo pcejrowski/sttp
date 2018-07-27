@@ -80,6 +80,16 @@ trait SyncHttpTestExtensions {
     }
   }
 
+  "download particular file" - {
+    "sttp release" in {
+      val fileUrl = uri"https://github.com/softwaremill/sttp/archive/v1.3.0-RC2.tar.gz"
+      val outputFile = new File("/Users/pcejrowski/Git/sttp/sttp.tar.gz")
+      val file =
+        sttp.get(fileUrl).response(asFile(outputFile)).send().unsafeBody
+      println(file)
+    }
+  }
+
   "download file" - {
 
     "download a binary file using asFile" in {

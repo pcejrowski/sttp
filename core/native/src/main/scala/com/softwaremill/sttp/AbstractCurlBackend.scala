@@ -1,6 +1,6 @@
 package com.softwaremill.sttp
 
-import java.io.ByteArrayInputStream
+import java.io.{ByteArrayInputStream, IOException}
 
 import com.softwaremill.sttp.curl.CurlApi._
 import com.softwaremill.sttp.curl.CurlCode.CurlCode
@@ -12,6 +12,7 @@ import com.softwaremill.sttp.internal._
 import scala.collection.immutable.Seq
 import scala.io.Source
 import scala.scalanative.native
+import scala.scalanative.native.stdio.FILE
 import scala.scalanative.native.stdlib._
 import scala.scalanative.native.string._
 import scala.scalanative.native.{CSize, Ptr, _}
@@ -24,6 +25,7 @@ abstract class AbstractCurlBackend[R[_], S](rm: MonadError[R], verbose: Boolean)
 
   private var headers: CurlList = _
   private var multiPartHeaders: Seq[CurlList] = Seq()
+  private var outputFile: Ptr[FILE] = _
 
   override def send[T](request: Request[T, S]): R[Response[T]] = native.Zone { implicit z =>
     val curl = CurlApi.init
@@ -44,8 +46,8 @@ abstract class AbstractCurlBackend[R[_], S](rm: MonadError[R], verbose: Boolean)
     }
 
     val spaces = responseSpace
-    curl.option(WriteFunction, AbstractCurlBackend.wdFunc)
-    curl.option(WriteData, spaces.bodyResp)
+    setResponseHandling(curl, spaces, request.response)
+
     curl.option(HeaderData, spaces.headersResp)
     curl.option(Url, request.uri.toString)
     curl.option(TimeoutMs, request.options.readTimeout.toMillis)
@@ -77,7 +79,7 @@ abstract class AbstractCurlBackend[R[_], S](rm: MonadError[R], verbose: Boolean)
         Response[T](
           rawErrorBody = b,
           code = httpCode,
-          statusText = responseHeaders.head._1.split(" ").last,
+          statusText = "200", //responseHeaders.head._1.split(" ").last,
           headers = responseHeaders.tail,
           history = Nil
         )
@@ -101,7 +103,7 @@ abstract class AbstractCurlBackend[R[_], S](rm: MonadError[R], verbose: Boolean)
   }
 
   private def setRequestBody(curl: CurlHandle, body: RequestBody[S])(implicit zone: Zone): R[CurlCode] =
-    body match { // todo: assign to responseMonad object
+    body match {
       case b: BasicRequestBody =>
         val str = basicBodyToString(b)
         lift(curl.option(PostFields, toCString(str)))
@@ -140,6 +142,28 @@ abstract class AbstractCurlBackend[R[_], S](rm: MonadError[R], verbose: Boolean)
       case InputStreamBody(b, _) => Source.fromInputStream(b).mkString
       case FileBody(f, _)        => Source.fromFile(f.toFile).mkString
     }
+
+  private def setResponseHandling[T](curl: CurlHandle, spaces: CurlSpaces, responseAs: ResponseAs[T, S])(
+      implicit zone: Zone): R[CurlCode] = {
+    responseAs match {
+      case MappedResponseAs(raw, _) => setResponseHandling(curl, spaces, raw)
+      case ResponseAsFile(output, overwrite) =>
+        val mode = if (overwrite) "wb" else "wbx"
+        outputFile = stdio.fopen(toCString(output.name), toCString(mode))
+        if (outputFile != null) {
+          curl.option(FollowLocation, true)
+          responseMonad.flatMap(lift(curl.option(WriteFunction, AbstractCurlBackend.wdFileFunc))) { _ =>
+            lift(curl.option(WriteData, outputFile))
+          }
+        } else {
+          responseMonad.error(new IOException("Cannot overwrite the file"))
+        }
+      case _ =>
+        responseMonad.flatMap(lift(curl.option(WriteFunction, AbstractCurlBackend.wdFunc))) { _ =>
+          lift(curl.option(WriteData, spaces.bodyResp))
+        }
+    }
+  }
 
   private def responseSpace: CurlSpaces = {
     val bodyResp = malloc(sizeof[CurlFetch]).cast[Ptr[CurlFetch]]
@@ -180,13 +204,8 @@ abstract class AbstractCurlBackend[R[_], S](rm: MonadError[R], verbose: Boolean)
           .getOrElse(enc)
         if (charset.compareToIgnoreCase(Utf8) == 0) responseMonad.unit(response)
         else responseMonad.map(toByteArray(response))(r => new String(r, charset.toUpperCase))
-      case ResponseAsByteArray => toByteArray(response)
-      case ResponseAsFile(output, overwrite) =>
-        responseMonad.map(toByteArray(response)) { a =>
-          val is = new ByteArrayInputStream(a)
-          val f = FileHelpers.saveFile(output.toFile, is, overwrite)
-          SttpFile.fromFile(f)
-        }
+      case ResponseAsByteArray       => toByteArray(response)
+      case ResponseAsFile(output, _) => responseMonad.unit(output)
       case ResponseAsStream() =>
         responseMonad.error(new IllegalStateException("CurlBackend does not support streaming responses"))
     }
@@ -225,5 +244,10 @@ object AbstractCurlBackend {
     size * nmemb
   }
 
+  def fileWriteData(ptr: Ptr[Byte], size: CSize, nmemb: CSize, stream: Ptr[Unit]): CSize = {
+    stdio.fwrite(ptr, size, nmemb, stream.cast[Ptr[FILE]])
+  }
+
   val wdFunc = CFunctionPtr.fromFunction4(writeData)
+  val wdFileFunc = CFunctionPtr.fromFunction4(fileWriteData)
 }
